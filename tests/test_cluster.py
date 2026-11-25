@@ -305,6 +305,37 @@ class ClusterTests(unittest.TestCase):
             self.start(member)
         self.assertEqual(self.cli("sql", "SELECT COUNT(*) FROM big")["rows"], [[21]])
 
+    def test_shell_formats_results_and_saves_history(self):
+        client = self.client()
+        client.execute("CREATE TABLE demo (id INTEGER PRIMARY KEY, name TEXT)")
+        client.execute("INSERT INTO demo VALUES (1, 'interactive')")
+        history = self.directory / "history"
+        command = [
+            sys.executable, "-m", "raftdb", "shell", "--config", str(self.config),
+            "--history", str(history),
+        ]
+        for statement in ("SELECT name FROM demo", "SELECT id FROM demo"):
+            result = subprocess.run(
+                command, input=f"{statement}\n.stats\n.quit\n", cwd=ROOT,
+                capture_output=True, text=True, timeout=10,
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertIn("1 row(s)", result.stdout)
+            self.assertIn("snapshot_bytes", result.stdout)
+        # Read using the platform's readline so both GNU readline and libedit
+        # history encodings are accepted.
+        saved = subprocess.check_output(
+            [sys.executable, "-c", (
+                "import json, readline, sys; readline.read_history_file(sys.argv[1]); "
+                "print(json.dumps([readline.get_history_item(i) for i in "
+                "range(1, readline.get_current_history_length() + 1)]))"
+            ), str(history)],
+            text=True,
+        )
+        self.assertEqual(json.loads(saved), [
+            "SELECT name FROM demo", ".stats", "SELECT id FROM demo", ".stats",
+        ])
+
     def test_parameter_binding_csv_exports_and_batches_across_failover(self):
         client = self.client()
         leader = self.leader()

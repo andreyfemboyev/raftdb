@@ -101,6 +101,7 @@ def shell(client, history):
         print(f"History unavailable ({error})", file=sys.stderr)
     existing = readline.get_current_history_length()
     readline.set_history_length(1000)
+    readline.set_auto_history(False)
     print("RaftDB SQL shell. Enter one statement per line. Use .status, .stats or .quit.")
     try:
         while True:
@@ -110,6 +111,7 @@ def shell(client, history):
                     continue
                 if sql in (".quit", ".exit"):
                     break
+                readline.add_history(sql)
                 if sql in (".status", ".stats"):
                     print_json(client.inspect(sql[1:]))
                     continue
