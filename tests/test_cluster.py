@@ -200,6 +200,14 @@ class ClusterTests(unittest.TestCase):
         self.assertEqual(self.submit(recovered, "write", write), results[0])
         self.assertEqual(self.cli("sql", "SELECT COUNT(*) FROM events")["rows"], [[1]])
 
+        def insert_distinct(number):
+            return self.submit(recovered, f"distinct-{number}", f"INSERT INTO events VALUES ({number}, 'batch')")
+
+        with ThreadPoolExecutor(max_workers=8) as workers:
+            writes = list(workers.map(insert_distinct, range(2, 26)))
+        self.assertEqual(len({result["index"] for result in writes}), len(writes))
+        self.assertEqual(self.cli("sql", "SELECT COUNT(*) FROM events")["rows"], [[25]])
+
     def test_minority_cannot_confirm_and_divergent_suffix_is_repaired(self):
         leader = self.leader()
         created = self.submit(leader, "create", "CREATE TABLE test (id INTEGER PRIMARY KEY)")
