@@ -2,6 +2,10 @@
 
 RaftDB is a distributed relational database implemented with the Python standard library. It includes a Raft consensus implementation, durable replicated storage, a SQL parser and executor, and a command-line client. A three-node cluster can continue serving new statements after losing one replica.
 
+## Related projects
+
+This is the original, simpler implementation. [RaftDB Extended](https://github.com/andreyfemboyev/raftfb_extended) builds on it with segmented storage, snapshots and additional SQL and client features. [Project portfolio](https://github.com/andreyfemboyev/portfolio).
+
 ## Run three replicas
 
 Use Python 3.10 or newer on a POSIX system with directory `fsync` and file locking support. Run the commands from this directory. The default configuration uses loopback ports 8091 through 8093.
