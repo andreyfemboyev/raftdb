@@ -118,24 +118,29 @@ class RaftLog:
                 self.term = self.base_term = snapshot["term"]
         elif kind == HARD and self.identity is not None:
             term, vote, commit = json.loads(data)
-            if (
-                not unsigned(term) or term < max(self.term, self.term_at(self.last_index))
-                or not unsigned(commit) or not self.commit <= commit <= self.last_index
-                or (vote is not None and not isinstance(vote, str))
-                or (term == self.term and self.vote is not None and vote != self.vote)
-            ):
-                raise CorruptionError("Invalid Raft hard state")
+            self.validate_hard(term, vote, commit)
             self.term, self.vote, self.commit = term, vote, commit
         elif kind == EDIT and self.identity is not None:
-            self.accept_edit(location, data)
+            first, entries = self.parse_edit(data)
+            self.index_edit(location, first, entries)
         else:
             raise CorruptionError("Invalid Raft journal frame order")
 
-    def accept_edit(self, location, data):
+    def validate_hard(self, term, vote, commit):
+        if (
+            self.identity is None
+            or not unsigned(term) or term < max(self.term, self.term_at(self.last_index))
+            or not unsigned(commit) or not self.commit <= commit <= self.last_index
+            or (vote is not None and not isinstance(vote, str))
+            or (term == self.term and self.vote is not None and vote != self.vote)
+        ):
+            raise CorruptionError("Invalid Raft hard state")
+
+    def parse_edit(self, data):
         if len(data) < U64.size:
             raise CorruptionError("Missing Raft edit index")
         first = U64.unpack_from(data)[0]
-        if not self.commit < first <= self.last_index + 1:
+        if self.identity is None or not self.commit < first <= self.last_index + 1:
             raise CorruptionError("Raft edit crosses the committed prefix or creates a gap")
         entries, position = [], U64.size
         previous_term = self.term_at(first - 1)
@@ -154,13 +159,20 @@ class RaftLog:
             if id_size:
                 data[start:start + id_size].decode("ascii")
                 data[start + id_size:end].decode("utf-8")
-            entries.append((term, location, position, end))
+            entries.append((term, position, end))
             position, previous_term = end, term
-        if not entries:
-            raise CorruptionError("Empty Raft edit")
-        self.entries[first - self.base - 1:] = entries
+        if not entries or first + len(entries) - 1 > MAX_INDEX:
+            raise CorruptionError("Invalid Raft edit length")
+        return first, entries
+
+    def index_edit(self, location, first, entries):
+        self.entries[first - self.base - 1:] = [
+            (term, location, start, end) for term, start, end in entries
+        ]
 
     def record(self, kind, data, *, sync=True):
+        if kind == HARD:
+            self.validate_hard(*json.loads(data))
         location = self.journal.append(kind, data)
         if sync:
             self.journal.sync()
@@ -176,7 +188,12 @@ class RaftLog:
             data.extend(ENTRY.pack(entry["term"], int(entry.get("legacy", False)), len(request_id), len(sql)))
             data.extend(request_id)
             data.extend(sql)
-        self.record(EDIT, data, sync=sync)
+        first, parsed = self.parse_edit(data)
+        location = self.journal.append(EDIT, data)
+        if sync:
+            self.journal.sync()
+        self.index_edit(location, first, parsed)
+        self.record_count += 1
 
 
 class Storage:

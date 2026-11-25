@@ -1,6 +1,7 @@
 from tempfile import TemporaryDirectory
 import unittest
 
+from raftdb.journal import CorruptionError
 from raftdb.raft import Node
 from raftdb.storage import Storage
 
@@ -48,6 +49,18 @@ class RaftTests(unittest.TestCase):
         self.assertTrue(self.append(2, 1, 1, [{"term": 2}], 2)["success"])
         self.assertEqual(self.node.commit, 2)
         self.assertEqual(self.node.log[2]["term"], 2)
+
+    def test_invalid_edits_and_hard_state_leave_the_durable_prefix_intact(self):
+        self.append(1, 0, 0, [{"term": 1}], 1)
+        size = self.node.log.journal.disk_bytes()
+        with self.assertRaises(CorruptionError):
+            self.storage.edit(1, [{"term": 1}])
+        with self.assertRaises(CorruptionError):
+            self.storage.edit(2, [{"term": 2}])
+        with self.assertRaises(CorruptionError):
+            self.storage.hard(1, None, 0)
+        self.assertEqual(self.node.log.journal.disk_bytes(), size)
+        self.storage.verify()
 
     def test_vote_survives_restart_and_rejects_an_outdated_log(self):
         self.append(1, 0, 0, [{"term": 1}], 1)
