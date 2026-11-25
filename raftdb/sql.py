@@ -1,9 +1,11 @@
 """Tokenize SQL, parse statements, and execute them against the relational state."""
 
+import json
 import operator
 import re
 from dataclasses import dataclass, field
 from itertools import islice
+from collections.abc import MutableMapping
 from sys import maxsize
 
 
@@ -50,6 +52,11 @@ class Create:
 
 
 @dataclass(frozen=True)
+class Drop:
+    table: str
+
+
+@dataclass(frozen=True)
 class Insert:
     table: str
     columns: list[str] | None
@@ -60,10 +67,11 @@ class Insert:
 class Select:
     table: str
     projection: list[str] | None
-    count: bool
+    aggregate: tuple[str, str | None] | None
     filters: list[Predicate]
     order: tuple[str, bool] | None
     limit: int | None
+    offset: int
 
 
 @dataclass(frozen=True)
@@ -80,7 +88,8 @@ class Delete:
 
 
 class Parser:
-    def __init__(self, sql: str):
+    def __init__(self, sql: str, *, legacy=False):
+        self.legacy = legacy
         self.tokens = []
         position = 0
         while position < len(sql):
@@ -212,12 +221,23 @@ class Parser:
         return self.grouped(self.literal)
 
     def select(self):
-        count = self.accept("COUNT")
+        aggregate = None
         projection = None
-        if count:
+        function = self.token[1].upper()
+        if self.legacy and self.accept("COUNT"):
             self.require("(")
             self.require("*")
             self.require(")")
+            aggregate = ("COUNT", None)
+        elif (
+            not self.legacy and function in ("COUNT", "SUM", "AVG", "MIN", "MAX")
+            and self.tokens[self.position + 1:self.position + 2] == [("symbol", "(")]
+        ):
+            self.require(function)
+            self.require("(")
+            column = None if function == "COUNT" and self.accept("*") else self.name()
+            self.require(")")
+            aggregate = (function, column)
         elif not self.accept("*"):
             projection = self.comma_list(self.name)
         self.require("FROM")
@@ -225,20 +245,31 @@ class Parser:
         filters = self.filters()
         order = None
         if self.accept("ORDER"):
-            if count:
-                raise SQLError("ORDER BY is unsupported with COUNT(*)")
+            if aggregate is not None:
+                if self.legacy:
+                    raise SQLError("ORDER BY is unsupported with COUNT(*)")
+                raise SQLError("ORDER BY is unsupported with aggregates")
             self.require("BY")
             column = self.name()
             descending = self.accept("DESC")
             if not descending:
                 self.accept("ASC")
             order = (column, descending)
-        limit = None
-        if self.accept("LIMIT"):
-            limit = self.integer()
-            if limit < 0:
-                raise SQLError("LIMIT must be non-negative")
-        return Select(table, projection, count, filters, order, limit)
+        limit = self.nonnegative("LIMIT", None)
+        offset = 0 if self.legacy else self.nonnegative("OFFSET", 0)
+        return Select(table, projection, aggregate, filters, order, limit, offset)
+
+    def nonnegative(self, keyword, default):
+        if not self.accept(keyword):
+            return default
+        value = self.integer()
+        if value < 0:
+            raise SQLError(f"{keyword} must be non-negative")
+        return value
+
+    def drop(self):
+        self.require("TABLE")
+        return Drop(self.name())
 
     def update(self):
         table = self.name()
@@ -254,6 +285,8 @@ class Parser:
             "CREATE": self.create, "INSERT": self.insert, "SELECT": self.select,
             "UPDATE": self.update, "DELETE": self.delete,
         }
+        if not self.legacy:
+            statements["DROP"] = self.drop
         for keyword, parse_statement in statements.items():
             if self.accept(keyword):
                 statement = parse_statement()
@@ -261,14 +294,16 @@ class Parser:
                 if self.token[0] != "end":
                     raise SQLError(f"Unexpected token {self.token[1]}")
                 return statement
-        raise SQLError("Expected CREATE, INSERT, SELECT, UPDATE or DELETE")
+        if self.legacy:
+            raise SQLError("Expected CREATE, INSERT, SELECT, UPDATE or DELETE")
+        raise SQLError("Expected CREATE, DROP, INSERT, SELECT, UPDATE or DELETE")
 
 
 @dataclass
 class Table:
     columns: dict[str, Column]
     primary: str
-    rows: dict[Value, dict[str, Value]] = field(default_factory=dict)
+    rows: MutableMapping[Value, dict[str, Value]] = field(default_factory=dict)
 
     def column(self, name):
         if name not in self.columns:
@@ -313,16 +348,20 @@ def unique(names):
 
 
 class Database:
-    def __init__(self):
-        self.tables: dict[str, Table] = {}
+    def __init__(self, tables=None, *, max_result=None):
+        self.tables = {} if tables is None else tables
+        self.max_result = max_result
 
-    def execute(self, sql: str) -> dict:
-        statement = Parser(sql).parse()
+    def execute(self, sql: str, *, legacy=False) -> dict:
+        statement = Parser(sql, legacy=legacy).parse()
         if isinstance(statement, Create):
             return self.create(statement)
         table = self.tables.get(statement.table)
         if table is None:
             raise SQLError(f"Unknown table {statement.table}")
+        if isinstance(statement, Drop):
+            del self.tables[statement.table]
+            return {"affected": 0}
         if isinstance(statement, Insert):
             return self.insert(table, statement)
         if isinstance(statement, Select):
@@ -364,9 +403,8 @@ class Database:
 
     def select(self, table, statement):
         rows = table.matching(statement.filters)
-        if statement.count:
-            count = sum(1 for _ in rows) if statement.limit != 0 else None
-            return {"columns": ["count"], "rows": [] if count is None else [[count]]}
+        if statement.aggregate is not None:
+            return self.aggregate(table, statement, rows)
         projection = list(table.columns) if statement.projection is None else statement.projection
         for name in projection:
             table.column(name)
@@ -375,9 +413,45 @@ class Database:
             table.column(name)
             # SQL NULLs sort first in ASC and last in DESC in this dialect.
             rows = sorted(rows, key=lambda row: (row[name] is not None, row[name]), reverse=descending)
-        if statement.limit is not None:
-            rows = islice(rows, min(statement.limit, maxsize))
-        return {"columns": projection, "rows": [[row[name] for name in projection] for row in rows]}
+        stop = None if statement.limit is None else min(statement.offset + statement.limit, maxsize)
+        rows = islice(rows, min(statement.offset, maxsize), stop)
+        records, size = [], 0
+        for row in rows:
+            record = [row[name] for name in projection]
+            if self.max_result is not None:
+                size += len(json.dumps(record, separators=(",", ":"), ensure_ascii=True)) + 1
+                if size > self.max_result:
+                    raise SQLError("SQL result exceeds the size limit")
+            records.append(record)
+        return {"columns": projection, "rows": records}
+
+    @staticmethod
+    def aggregate(table, statement, rows):
+        function, column = statement.aggregate
+        if column is not None:
+            spec = table.column(column)
+            if function in ("SUM", "AVG") and spec.kind != "INTEGER":
+                raise SQLError(f"{function} requires an INTEGER column")
+        result = {"columns": [function.lower()], "rows": []}
+        if statement.limit == 0 or statement.offset:
+            return result
+        values = (row[column] for row in rows if row[column] is not None) if column else rows
+        if function == "COUNT":
+            value = sum(1 for _ in values)
+        elif function == "MIN":
+            value = min(values, default=None)
+        elif function == "MAX":
+            value = max(values, default=None)
+        else:
+            total, count = 0, 0
+            for value in values:
+                total += value
+                count += 1
+            value = None
+            if count:
+                value = total if function == "SUM" else total / count
+        result["rows"] = [[value]]
+        return result
 
     def update(self, table, statement):
         unique([name for name, _ in statement.assignments])
@@ -386,15 +460,17 @@ class Database:
             table.validate(name, value)
         replacements = {}
         matched = list(table.matching(statement.filters))
-        original_keys = {row[table.primary] for row in matched}
+        keys = [row[table.primary] for row in matched]
+        original_keys = set(keys)
         for row in matched:
             updated = row | changes
             key = updated[table.primary]
             if key in replacements or (key in table.rows and key not in original_keys):
                 raise SQLError("Duplicate primary key")
             replacements[key] = updated
-        for key in original_keys - replacements.keys():
-            del table.rows[key]
+        for key in keys:
+            if key not in replacements:
+                del table.rows[key]
         table.rows.update(replacements)
         return {"affected": len(replacements)}
 

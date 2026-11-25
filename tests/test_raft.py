@@ -1,6 +1,7 @@
 from tempfile import TemporaryDirectory
 import unittest
 
+from raftdb.journal import CorruptionError
 from raftdb.raft import Node
 from raftdb.storage import Storage
 
@@ -15,8 +16,9 @@ class RaftTests(unittest.TestCase):
 
     def open_node(self):
         self.storage = Storage(self.directory)
-        self.addCleanup(self.storage.lock.close)
+        self.addCleanup(self.storage.close)
         self.node = Node("a", self.members, "raft-unit-test", self.storage)
+        self.addCleanup(self.node.db.store.close)
 
     def append(self, term, prev, prev_term, entries, commit):
         return self.node.append_entries({
@@ -48,11 +50,24 @@ class RaftTests(unittest.TestCase):
         self.assertEqual(self.node.commit, 2)
         self.assertEqual(self.node.log[2]["term"], 2)
 
+    def test_invalid_edits_and_hard_state_leave_the_durable_prefix_intact(self):
+        self.append(1, 0, 0, [{"term": 1}], 1)
+        size = self.node.log.journal.disk_bytes()
+        with self.assertRaises(CorruptionError):
+            self.storage.edit(1, [{"term": 1}])
+        with self.assertRaises(CorruptionError):
+            self.storage.edit(2, [{"term": 2}])
+        with self.assertRaises(CorruptionError):
+            self.storage.hard(1, None, 0)
+        self.assertEqual(self.node.log.journal.disk_bytes(), size)
+        self.storage.verify()
+
     def test_vote_survives_restart_and_rejects_an_outdated_log(self):
         self.append(1, 0, 0, [{"term": 1}], 1)
         ballot = {"source": "b", "term": 2, "last_term": 1, "last_index": 1}
         self.assertTrue(self.node.request_vote(ballot)["granted"])
-        self.storage.lock.close()
+        self.node.db.store.close()
+        self.storage.close()
         self.open_node()
         self.assertFalse(self.node.request_vote(ballot | {"source": "c"})["granted"])
         self.assertFalse(self.node.request_vote(

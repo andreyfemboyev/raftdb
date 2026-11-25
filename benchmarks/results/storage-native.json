@@ -1,0 +1,12 @@
+{
+  "revision": "ae435aee571e7a8dc74d3b98dc95b13cd178f7d2",
+  "seed": 42,
+  "payload_bytes": 256,
+  "operations": 1200,
+  "operations_per_second": 2455.4,
+  "p50_ms": 0.35,
+  "p95_ms": 0.561,
+  "p99_ms": 1.536,
+  "restart_ms": 6.514,
+  "disk_bytes": 450422
+}

@@ -1,52 +1,30 @@
-"""Run a RaftDB node or query a cluster."""
+"""Run replicas and operate a RaftDB cluster."""
 
 import argparse
-import hashlib
-import http.client
+import csv
 import json
+import os
 from pathlib import Path
 import sys
 import time
-from uuid import uuid4
 
-from .raft import Node, PROPOSAL_TIMEOUT, rpc
-from .server import Server, valid_request_id, valid_sql
+from .client import Client, QueryError
+from .config import load_cluster
+from .journal import DEFAULT_SEGMENT_SIZE
+from .raft import Node, SNAPSHOT_INTERVAL
+from .relational import Relational
+from .server import Server
 from .storage import Storage
-
-
-def load_cluster(path):
-    with Path(path).open(encoding="utf-8") as source:
-        config = json.load(source)
-    if not isinstance(config, dict) or set(config) != {"cluster", "nodes"}:
-        raise ValueError("Config requires cluster and nodes fields")
-    name = config["cluster"]
-    if not isinstance(name, str) or not name.strip():
-        raise ValueError("Expected a non-empty cluster name")
-    members = {}
-    if not isinstance(config["nodes"], dict) or not config["nodes"]:
-        raise ValueError("Expected a non-empty map of node IDs to host:port strings")
-    for node, binding in config["nodes"].items():
-        if not valid_request_id(node) or not isinstance(binding, str):
-            raise ValueError("Invalid node ID or address")
-        host, separator, port = binding.partition(":")
-        if not host or not separator or not port.isascii() or not port.isdecimal():
-            raise ValueError(f"Invalid host:port for {node}")
-        if len(port) > 5 or not 0 < int(port) < 65536 or any(char.isspace() for char in host):
-            raise ValueError(f"Invalid host:port for {node}")
-        members[node] = (host, int(port))
-    if len(set(members.values())) != len(members):
-        raise ValueError("Each node requires a distinct address")
-    canonical = json.dumps({"cluster": name, "nodes": members}, sort_keys=True)
-    return members, hashlib.sha256(canonical.encode()).hexdigest()
 
 
 def serve(args, members, cluster):
     if args.node not in members:
         raise ValueError(f"Unknown node {args.node}")
     host, port = members[args.node]
-    storage = Storage(args.data)
+    storage = Storage(args.data, segment_size=args.segment_size)
+    node = None
     try:
-        node = Node(args.node, members, cluster, storage)
+        node = Node(args.node, members, cluster, storage, snapshot_interval=args.snapshot_interval)
         with Server((args.bind or host, port), node) as server:
             node.start()
             print(f"Node {args.node} listening on {args.bind or host}:{port}", flush=True)
@@ -57,69 +35,113 @@ def serve(args, members, cluster):
             finally:
                 node.stop()
     finally:
-        storage.lock.close()
+        try:
+            if node is not None:
+                node.db.store.close()
+        finally:
+            storage.close()
     return 0
 
 
-def query(args, members):
-    sql = args.sql if args.sql is not None else sys.stdin.read()
-    if not valid_sql(sql):
-        raise ValueError("Expected one non-empty SQL statement, at most 16384 UTF-8 bytes")
-    request_id = args.request_id if args.request_id is not None else uuid4().hex
-    if not valid_request_id(request_id):
-        raise ValueError("Invalid request ID")
-    deadline = time.monotonic() + args.timeout
-    candidates = list(members)
-    last_error = "No cluster nodes responded"
-    payload = {"sql": sql, "request_id": request_id}
-    while time.monotonic() < deadline:
-        if not candidates:
-            candidates = list(members)
-            time.sleep(min(0.1, max(0, deadline - time.monotonic())))
-        target = candidates.pop(0)
-        remaining = deadline - time.monotonic()
-        if remaining <= 0:
-            break
+def verify_offline(directory):
+    storage = Storage(directory, repair=False)
+    try:
+        if storage.log.identity is None:
+            raise ValueError("Uninitialized Raft journal")
+        relational = Relational(storage.directory / "relational", DEFAULT_SEGMENT_SIZE, repair=False)
         try:
-            status, result = rpc(
-                members[target], "/sql", payload, timeout=min(PROPOSAL_TIMEOUT + 0.5, remaining)
-            )
-        except (OSError, http.client.HTTPException, ValueError) as error:
-            last_error = str(error)
-            continue
-        if not isinstance(result, dict):
-            continue
-        if status in (200, 400, 409, 422):
-            print(json.dumps(result, ensure_ascii=True, indent=2))
-            return 0 if status == 200 else 2
-        last_error = result.get("error", last_error)
-        hint = result.get("leader")
-        if isinstance(hint, str) and hint in candidates:
-            candidates.remove(hint)
-            candidates.insert(0, hint)
-
-    print(json.dumps({
-        "ok": False, "code": "unconfirmed", "request_id": request_id, "error": last_error,
-    }, indent=2))
-    return 2
-
-
-def status(args, members):
-    if args.node is not None and args.node not in members:
-        raise ValueError(f"Unknown node {args.node}")
-    states = {}
-    for node in [args.node] if args.node is not None else members:
-        connection = http.client.HTTPConnection(*members[node], timeout=0.5)
-        try:
-            connection.request("GET", "/status")
-            with connection.getresponse() as response:
-                states[node] = json.load(response)
-        except (OSError, http.client.HTTPException, ValueError) as error:
-            states[node] = {"error": str(error)}
+            if relational.applied > storage.log.commit:
+                raise ValueError("Relational checkpoint exceeds durable Raft commit")
+            relational.verify()
+            if storage.log.snapshot is not None:
+                relational.validate_snapshot(storage.snapshot_path, storage.log.base)
+            return {
+                "ok": True, "verified_index": relational.applied, "commit_index": storage.log.commit,
+                "snapshot_index": storage.log.base, "replay_pending": storage.log.commit - relational.applied,
+            }
         finally:
-            connection.close()
-    print(json.dumps(states, indent=2))
-    return 2 if all("error" in state for state in states.values()) else 0
+            relational.store.close()
+    finally:
+        storage.close()
+
+
+def print_json(result):
+    print(json.dumps(result, ensure_ascii=True, indent=2))
+
+
+def cell(value):
+    if value is None:
+        return "NULL"
+    if type(value) is bool:
+        return str(value).upper()
+    text = str(value)
+    text = "".join(char if char.isprintable() else repr(char)[1:-1] for char in text)
+    return text if len(text) <= 60 else text[:59] + "…"
+
+
+def print_table(columns, records):
+    rows = [[cell(value) for value in row] for row in (columns, *records)]
+    widths = [max(len(value) for value in values) for values in zip(*rows)]
+    for number, row in enumerate(rows):
+        print(" | ".join(value.ljust(width) for value, width in zip(row, widths)).rstrip())
+        if number == 0:
+            print("-+-".join("-" * width for width in widths))
+    print(f"{len(records)} row(s)")
+
+
+def shell(client, history):
+    import readline
+
+    history = Path(history).expanduser()
+    try:
+        readline.read_history_file(history)
+    except FileNotFoundError:
+        pass
+    except OSError as error:
+        print(f"History unavailable ({error})", file=sys.stderr)
+    existing = readline.get_current_history_length()
+    readline.set_history_length(1000)
+    readline.set_auto_history(False)
+    print("RaftDB SQL shell. Enter one statement per line. Use .status, .stats or .quit.")
+    try:
+        while True:
+            try:
+                sql = input("raftdb> ").strip()
+                if not sql:
+                    continue
+                if sql in (".quit", ".exit"):
+                    break
+                readline.add_history(sql)
+                if sql in (".status", ".stats"):
+                    print_json(client.inspect(sql[1:]))
+                    continue
+                started = time.perf_counter()
+                result = client.execute(sql)
+                if "rows" in result:
+                    print_table(result["columns"], result["rows"])
+                else:
+                    print(f"{result['affected']} row(s) affected")
+                print(f"{(time.perf_counter() - started) * 1000:.1f} ms")
+            except EOFError:
+                print()
+                break
+            except KeyboardInterrupt:
+                print()
+            except QueryError as error:
+                suffix = f" (request {error.request_id})" if error.request_id else ""
+                print(f"{error}{suffix}", file=sys.stderr)
+            except ValueError as error:
+                print(error, file=sys.stderr)
+    finally:
+        try:
+            history.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+            history.touch(mode=0o600)
+            new_entries = readline.get_current_history_length() - existing
+            if new_entries > 0:
+                readline.append_history_file(new_entries, history)
+        except OSError as error:
+            print(f"Cannot save SQL history ({error})", file=sys.stderr)
+    return 0
 
 
 def positive_timeout(raw):
@@ -129,33 +151,106 @@ def positive_timeout(raw):
     return value
 
 
-def main():
-    parser = argparse.ArgumentParser(prog="python3 -m raftdb")
+def cli_parser():
+    parser = argparse.ArgumentParser(prog="python -m raftdb")
     sub = parser.add_subparsers(dest="operation", required=True)
     server = sub.add_parser("serve", help="Start one replica")
     server.add_argument("--node", required=True)
     server.add_argument("--data", required=True)
+    server.add_argument("--segment-size", type=int, default=DEFAULT_SEGMENT_SIZE, metavar="BYTES")
+    server.add_argument("--snapshot-interval", type=int, default=SNAPSHOT_INTERVAL, metavar="ENTRIES")
     server.add_argument("--bind", help="Override the local bind host while retaining the configured port")
+    server.add_argument("--config", default="cluster.json")
 
-    client = sub.add_parser("sql", help="Execute a SQL statement, given as an argument or on stdin")
+    client = sub.add_parser("sql", help="Execute one statement from an argument or standard input")
     client.add_argument("sql", nargs="?")
     client.add_argument("--request-id", help="Reuse this ID when retrying the same operation")
-    client.add_argument("--timeout", type=positive_timeout, default=6.0)
 
-    inspector = sub.add_parser("status", help="Show observed leader and replica progress")
-    inspector.add_argument("--node")
-    for command in (server, client, inspector):
+    interactive = sub.add_parser("shell", help="Open the interactive SQL shell")
+    state_home = Path(os.environ.get("XDG_STATE_HOME") or Path.home() / ".local" / "state")
+    interactive.add_argument("--history", default=state_home / "raftdb" / "history", metavar="PATH")
+
+    commands = [client, interactive]
+    for name, description in {
+        "status": "Show observed leader and replica progress",
+        "stats": "Show local log, snapshot and relational storage usage",
+        "compact": "Snapshot applied state and reclaim obsolete storage",
+        "snapshot": "Publish a snapshot of each selected replica's applied state",
+        "verify": "Check durable records, indexes and snapshots on selected replicas",
+    }.items():
+        command = sub.add_parser(name, help=description)
+        target = command.add_mutually_exclusive_group() if name == "verify" else command
+        target.add_argument("--node", help="Target one replica instead of all configured replicas")
+        if name == "verify":
+            target.add_argument("--data", help="Verify a stopped replica's data directory without repairs")
+        commands.append(command)
+
+    importer = sub.add_parser("import-csv", help="Insert CSV records into an existing table")
+    importer.add_argument("table")
+    importer.add_argument("path", type=Path)
+    importer.add_argument("--types", required=True, metavar="COLUMN:TYPE,...")
+    importer.add_argument("--batch-size", type=int, default=100)
+    importer.add_argument("--request-id", help="Use the same prefix and CSV to resume an interrupted import")
+    exporter = sub.add_parser("export", help="Export one committed SELECT result")
+    exporter.add_argument("sql")
+    exporter.add_argument("--format", choices=("csv", "json"), default="csv")
+    exporter.add_argument("--batch-size", type=int, default=1000)
+    commands.extend((importer, exporter))
+    for command in commands:
         command.add_argument("--config", default="cluster.json")
-    args = parser.parse_args()
+        command.add_argument("--timeout", type=positive_timeout, default=6.0)
 
+    from .benchmark import add_arguments
+
+    add_arguments(sub.add_parser("benchmark", help="Measure a disposable three-node cluster"))
+    return parser
+
+
+def main():
+    args = cli_parser().parse_args()
     try:
+        operation = args.operation
+        if operation == "benchmark":
+            from .benchmark import run
+
+            print_json(run(args))
+            return 0
+        if operation == "verify" and args.data is not None:
+            print_json(verify_offline(args.data))
+            return 0
         members, cluster = load_cluster(args.config)
-        if args.operation == "serve":
+        if operation == "serve":
             return serve(args, members, cluster)
-        if args.operation == "sql":
-            return query(args, members)
-        return status(args, members)
-    except (OSError, ValueError, KeyError, TypeError) as error:
+        client = Client(members, cluster=cluster, timeout=args.timeout)
+        if operation == "sql":
+            sql = args.sql if args.sql is not None else sys.stdin.read()
+            status, result = client.request(sql, request_id=args.request_id)
+            print_json(result)
+            return 0 if status == 200 else 2
+        if operation == "shell":
+            return shell(client, args.history)
+        if operation == "import-csv":
+            types = dict(part.split(":", 1) for part in args.types.split(","))
+            with args.path.open(encoding="utf-8", newline="") as source:
+                affected = client.import_csv(
+                    args.table, source, {name: kind.upper() for name, kind in types.items()},
+                    batch_size=args.batch_size, request_id=args.request_id,
+                )
+            print_json({"ok": True, "affected": affected})
+            return 0
+        if operation == "export":
+            export = client.export_csv if args.format == "csv" else client.export_json
+            export(sys.stdout, args.sql, batch_size=args.batch_size)
+            return 0
+        states = client.inspect(operation, node=args.node)
+        print_json(states)
+        errors = ["error" in state for state in states.values()]
+        failed = all(errors) if operation == "status" else any(errors)
+        return 2 if failed else 0
+    except QueryError as error:
+        print(f"raftdb: {error} (request {error.request_id})", file=sys.stderr)
+        return 2
+    except (OSError, ValueError, KeyError, TypeError, csv.Error) as error:
         print(f"raftdb: {error}", file=sys.stderr)
         return 2
 

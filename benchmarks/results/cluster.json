@@ -1,0 +1,89 @@
+{
+  "python": "3.12.14",
+  "platform": "Linux-6.18.57-x86_64-with-glibc2.41",
+  "nodes": 3,
+  "clients": 1,
+  "seed": 42,
+  "payload_bytes": 256,
+  "durability": "Each version's default fsync-before-ack settings",
+  "native_revision": "ae435aee571e7a8dc74d3b98dc95b13cd178f7d2",
+  "native": {
+    "insert": {
+      "operations": 384,
+      "p50_ms": 2.556,
+      "p95_ms": 3.197,
+      "p99_ms": 4.136,
+      "operations_per_second": 378.36
+    },
+    "read": {
+      "operations": 128,
+      "p50_ms": 2.484,
+      "p95_ms": 3.023,
+      "p99_ms": 12.687,
+      "operations_per_second": 376.51
+    },
+    "update": {
+      "operations": 128,
+      "p50_ms": 2.532,
+      "p95_ms": 3.251,
+      "p99_ms": 4.569,
+      "operations_per_second": 382.86
+    },
+    "all_replica_apply": {
+      "operations": 24,
+      "p50_ms": 3.923,
+      "p95_ms": 10.058,
+      "p99_ms": 10.12
+    },
+    "disk_bytes_before_compaction": 2016252,
+    "memory_before_restart": {
+      "cluster_rss_bytes": 57917440,
+      "max_node_peak_rss_bytes": 19345408
+    },
+    "restart_to_quorum_read_ms": 572.759,
+    "recovery_verified_rows": 384,
+    "compaction": {
+      "all_nodes_ms": 38.739,
+      "bytes_before": 2017845,
+      "bytes_after": 1757841
+    }
+  },
+  "baseline_revision": "7477321054526680df4652414c9b7a33abbc5bc3",
+  "json_baseline": {
+    "insert": {
+      "operations": 384,
+      "p50_ms": 79.01,
+      "p95_ms": 81.202,
+      "p99_ms": 82.66,
+      "operations_per_second": 12.64
+    },
+    "read": {
+      "operations": 128,
+      "p50_ms": 80.153,
+      "p95_ms": 81.858,
+      "p99_ms": 84.39,
+      "operations_per_second": 12.44
+    },
+    "update": {
+      "operations": 128,
+      "p50_ms": 80.558,
+      "p95_ms": 81.758,
+      "p99_ms": 82.844,
+      "operations_per_second": 12.38
+    },
+    "all_replica_apply": {
+      "operations": 24,
+      "p50_ms": 159.48,
+      "p95_ms": 163.269,
+      "p99_ms": 165.375
+    },
+    "disk_bytes_before_compaction": 466035,
+    "memory_before_restart": {
+      "cluster_rss_bytes": 58888192,
+      "max_node_peak_rss_bytes": 19865600
+    },
+    "restart_to_quorum_read_ms": 743.008,
+    "recovery_verified_rows": 384,
+    "compaction": null
+  }
+}
