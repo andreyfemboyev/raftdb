@@ -1,81 +1,103 @@
-# RaftDB
+# RaftDB v0.2.0
 
-RaftDB is a distributed relational database implemented with the Python standard library. It includes a Raft consensus implementation, durable replicated storage, a SQL parser and executor, and a command-line client. A three-node cluster can continue serving new statements after losing one replica.
+RaftDB is a fixed-membership relational database for Python 3.10+ on Linux/POSIX. It uses a custom SQL engine, Raft, and a native Bitcask-style relational store. The database and its CLI use the Python standard library.
 
-## Run three replicas
+## Run a cluster
 
-Use Python 3.10 or newer on a POSIX system with directory `fsync` and file locking support. Run the commands from this directory. The default configuration uses loopback ports 8091 through 8093.
-
-```sh
-# Terminal 1
-python3 -m raftdb serve --node n1 --data ./data/n1
-
-# Terminal 2
-python3 -m raftdb serve --node n2 --data ./data/n2
-
-# Terminal 3
-python3 -m raftdb serve --node n3 --data ./data/n3
-```
-
-In a fourth terminal, run these commands. The SQL client discovers the leader and follows leader hints as it retries.
+Run each server in a separate terminal from the repository root. The supplied configuration uses loopback ports 8091–8093.
 
 ```sh
-python3 -m raftdb status
-python3 -m raftdb sql "CREATE TABLE tasks (id INTEGER PRIMARY KEY, title TEXT NOT NULL, done BOOLEAN)"
-python3 -m raftdb sql --request-id seed-tasks "INSERT INTO tasks VALUES (1, 'Write tests', TRUE), (2, 'Review results', FALSE)"
-python3 -m raftdb sql "SELECT id, title FROM tasks WHERE done = FALSE ORDER BY id LIMIT 10"
+python -m raftdb serve --node n1 --data ./data/n1
+python -m raftdb serve --node n2 --data ./data/n2
+python -m raftdb serve --node n3 --data ./data/n3
 ```
 
-The query returns the columns `id` and `title` with the row `[2, "Review results"]`. Stop the reported leader with Ctrl+C, run `status` again after the election, and issue another query. Restart the stopped replica using the original data directory so it can replay its committed log and catch up.
+In a fourth terminal, try the following commands.
 
-For separate hosts, give every process the same cluster configuration with a unique cluster name and reachable IPv4 hostnames or addresses and ports. Pass it to commands using `--config /path/to/cluster.json`. Give each replica its own data directory. Use `--bind` on a server if its listening address differs from its advertised address. Run all nodes on a private, trusted network because peer and client requests share an unauthenticated HTTP listener.
+```sh
+python -m raftdb status
+python -m raftdb sql "CREATE TABLE tasks (id INTEGER PRIMARY KEY, title TEXT NOT NULL, done BOOLEAN)"
+python -m raftdb sql --request-id seed-tasks "INSERT INTO tasks VALUES (1, 'Write tests', TRUE), (2, 'Review results', FALSE)"
+python -m raftdb sql "SELECT id, title FROM tasks WHERE done = FALSE ORDER BY id LIMIT 10"
+python -m raftdb shell
+```
 
-## SQL dialect
+The SQL client follows leader hints and retries. In the shell, use one statement per line and use `.status`, `.stats`, or `.quit`. The shell shows elapsed time and saves history under the XDG state directory. Override the file with `--history PATH`.
 
-| Statement | Example |
+Use `--config PATH` on each command to select a different cluster. All nodes must share the same configuration, and each replica needs its own data directory. The [single-node example](examples/single.json) is suitable for local experiments. The [SQL examples](examples/tasks.sql) contain individual statements that can be submitted one at a time.
+
+Each server accepts `--segment-size BYTES` (default 16 MiB) and `--snapshot-interval ENTRIES` (default 256 applied entries). `--bind` overrides the listening host while retaining the advertised port. Use a private, trusted network. The HTTP listener accepts unauthenticated replica, client, and maintenance requests.
+
+## SQL
+
+| Operation | Example |
 | --- | --- |
-| Create a table | `CREATE TABLE tasks (id INTEGER PRIMARY KEY, title TEXT NOT NULL, done BOOLEAN)` |
-| Insert multiple rows | `INSERT INTO tasks (id, title) VALUES (3, 'Add notes'), (4, 'It''s ready')` |
-| Read and sort | `SELECT id, title FROM tasks WHERE done IS NULL ORDER BY id DESC LIMIT 5` |
-| Count matching rows | `SELECT COUNT(*) FROM tasks WHERE id > 1 AND done IS NOT NULL` |
-| Update matching rows | `UPDATE tasks SET done = TRUE WHERE id = 2` |
-| Delete matching rows | `DELETE FROM tasks WHERE id = 3` |
+| Create | `CREATE TABLE tasks (id INTEGER PRIMARY KEY, title TEXT NOT NULL, done BOOLEAN)` |
+| Drop | `DROP TABLE tasks` |
+| Insert | `INSERT INTO tasks (id, title) VALUES (3, 'Add notes'), (4, 'It''s ready')` |
+| Select | `SELECT id, title FROM tasks WHERE done IS NULL ORDER BY id DESC LIMIT 5 OFFSET 1` |
+| Aggregate | `SELECT COUNT(*) FROM tasks WHERE id > 1` |
+| Update | `UPDATE tasks SET done = TRUE WHERE id = 2` |
+| Delete | `DELETE FROM tasks WHERE id = 3` |
 
-A table requires one primary key. Types are signed 64-bit `INTEGER`, `TEXT`, and `BOOLEAN`. Missing values on inserts default to `NULL` where allowed. The engine accepts one statement per request, with an optional trailing semicolon. Identifiers are unquoted and case-insensitive. String values use single quotes, with doubled quotes for an embedded apostrophe.
+Tables require one primary key. Column types are signed 64-bit `INTEGER`, `TEXT`, and `BOOLEAN`. Missing insert values default to `NULL` where allowed. Identifiers are unquoted and case-insensitive. Escape an apostrophe in SQL text by doubling it. The parser accepts one statement per request and an optional trailing semicolon.
 
-Filters support literal comparisons, `IS [NOT] NULL`, and `AND`. Comparisons involving a null do not match. Nulls sort first in ascending order and last in descending order. Use `ORDER BY` when row order matters. `UPDATE` and `DELETE` apply to all rows if the statement omits `WHERE`. Each mutation is atomic, including multi-row inserts and updates that fail constraint validation.
+`WHERE` supports comparisons to literals, `IS [NOT] NULL`, and `AND`. Use `ORDER BY` when row order matters. Nulls sort first in ascending order and last in descending order. `UPDATE` and `DELETE` apply to all rows when `WHERE` is omitted. A single statement is atomic, including constraint failures.
 
-## HTTP interface and retries
+An aggregate query has one aggregate expression. `COUNT(*)` counts rows and `COUNT(column)` counts non-null values. `SUM` and `AVG` take integers and return `NULL` for an empty or all-null input. `AVG` returns a floating-point number. `MIN` and `MAX` use the column's ordering and ignore nulls. See the [roadmap](ROADMAP.md) for features outside this release.
 
-`GET /status` reports the observed role, term, leader hint, and replica indices. A node that still reports itself as leader may have lost contact with a quorum.
+## Client and data interchange
 
-`POST /sql` accepts a JSON object containing a unique `request_id` and one `sql` string of up to 16 KiB in UTF-8. Successful responses contain `ok`, `request_id`, the committed log `index`, and either `affected` or `columns` and `rows`.
+```python
+from raftdb import Client
 
-| HTTP status | Meaning |
-| --- | --- |
-| 200 | The statement committed and executed successfully |
-| 400 | The request envelope is invalid |
-| 409 | The request ID is already bound to different SQL |
-| 422 | The statement committed and returned a SQL error |
-| 503 | The contacted node was unable to confirm the operation |
-
-On a timeout or connection failure, the outcome may still be pending. Retry the exact same SQL with the same request ID. The state machine deduplicates the request and returns the original outcome, including across leader changes and full process restarts. The CLI generates an ID by default and prints it on an unconfirmed outcome. A fresh read needs a fresh request ID.
-
-## Implementation
-
-- `raftdb/raft.py` handles randomized leader election, durable votes, AppendEntries, log repair, and majority commit. A leader commits by counting replicas for an entry in its current term, thereby also committing its preceding log.
-- `raftdb/storage.py` persists the term, vote, commit index, and log with file and directory `fsync` and atomic replacement. Each node reconstructs its relational state and request outcomes by replaying its committed prefix at startup.
-- `raftdb/sql.py` tokenizes SQL, builds statement objects, validates schemas and constraints, and executes primary-key lookups, scans, filters, projections, sorting, and counts.
-- `raftdb/server.py` exposes the HTTP interface. `raftdb/__main__.py` runs the node and the retrying client.
-
-New reads and writes go through the same Raft log. Applying each statement at its committed position gives fresh reads and writes a single consistent order, even during leader changes. This trades read throughput for a straightforward consistency model.
-
-This implementation is sized for a small cluster and datasets that fit in memory. Membership is fixed, and a full durable log image is written on each persistence event. The log and request outcome cache grow with use. The SQL subset omits joins, secondary indexes, and multi-statement transactions. The server is designed to tolerate process crashes and network outages among trusted replicas.
-
-## Verification
-
-```sh
-python3 -m unittest discover -s tests -v
+db = Client.from_config("cluster.json")
+db.execute(
+    "INSERT INTO tasks VALUES (?, ?, ?)",
+    [3, "O'Brien's notes", False],
+    request_id="tasks-import-3",
+)
+for page in db.query_batches("SELECT id, title FROM tasks ORDER BY id", batch_size=100):
+    print(page["columns"], page["rows"])
 ```
 
-The suite starts three real node processes on ephemeral ports. It checks leader replacement, durable recovery after a full cluster crash, concurrent retries, refusal to confirm fresh reads and writes on a minority, and repair of a conflicting uncommitted log suffix.
+Question marks bind scalar values. Use the same request ID and bound SQL to retry an operation with an uncertain outcome. Use a fresh ID for a fresh read. Each page of a batched result comes from the same committed SELECT. Server-side results are materialized and new results are capped at 16 MiB when encoded. Pagination bounds response batches. See [CONSISTENCY.md](CONSISTENCY.md) for the read and retry contracts.
+
+```sh
+python -m raftdb export --format csv "SELECT * FROM tasks ORDER BY id" > tasks.csv
+python -m raftdb export --format json "SELECT * FROM tasks ORDER BY id" > tasks.json
+python -m raftdb sql "CREATE TABLE imported_tasks (id INTEGER PRIMARY KEY, title TEXT, done BOOLEAN)"
+python -m raftdb import-csv imported_tasks tasks.csv --types id:INTEGER,title:TEXT,done:BOOLEAN --request-id import-tasks
+```
+
+Import into an existing table with compatible columns and unused primary keys. CSV uses `\N` for SQL null and doubles a leading backslash on text values. Imports commit one batch at a time and split batches at the SQL byte limit. Retry with the same file, type map, batch size, and request prefix after a failed import. Python methods also accept file-like objects. Install `.[data-science]` to use the optional `to_pandas` and `to_numpy` methods.
+
+## Operations
+
+```sh
+python -m raftdb stats
+python -m raftdb snapshot --node n1
+python -m raftdb compact --node n1
+python -m raftdb verify
+python -m raftdb verify --data ./data/n1  # n1 must be stopped
+```
+
+Online operations use the node's data lock and its Raft mutex. Snapshot and compact act per replica on applied committed state. They can temporarily delay that replica. Target replicas sequentially for large datasets. Offline verification takes the same exclusive directory lock and leaves the files untouched.
+
+### Upgrade from the JSON format
+
+Stop the entire v0.1 cluster and back up all data directories. Start every replica with v0.2 using its existing node ID, configuration, and directory. The first start imports the original term, vote, committed prefix, and uncommitted suffix. Imported statements replay with their original dialect, including recorded SQL errors. The original `raft.json` remains as the pre-upgrade image. Keep using the native files after upgrade. Rollback to v0.1 requires restoring the full pre-upgrade backup and loses any writes acknowledged after that backup.
+
+## Verify and benchmark
+
+```sh
+python -W error::ResourceWarning -m unittest discover -s tests -v
+python -m raftdb benchmark --baseline /path/to/original-raftdb
+python benchmarks/storage.py /path/to/raftdb
+```
+
+See [benchmark methodology and results](benchmarks/README.md), [architecture](ARCHITECTURE.md), and the [storage format](STORAGE_FORMAT.md).
+
+## Attribution and licensing
+
+RaftDB retains its existing source history and authorship. The new storage design adapts the append-only segments, CRC checking, on-demand values, and atomic generation publication from femboydevs' BitcaskDB. GitHub lists no license and neither inspected repository contains a license file. This integration adds no license declaration. [RaftDB base](https://github.com/andreyfemboyev/raftdb/tree/7477321054526680df4652414c9b7a33abbc5bc3) · [BitcaskDB design reference](https://github.com/andreyfemboyev/bitcask-db/tree/e6beaa06130815811cd1048e8e89bfea5e726ad9)

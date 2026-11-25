@@ -1,12 +1,14 @@
 """HTTP endpoints for Raft RPCs, SQL requests, and node status."""
 
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+import base64
 import json
 import os
 import re
 import traceback
 
-from .raft import BATCH_SIZE, MAX_REQUEST_ID, MAX_SQL_BYTES
+from .raft import BATCH_SIZE, MAX_REQUEST_ID, MAX_SQL_BYTES, SNAPSHOT_CHUNK
+from .storage import unsigned, valid_snapshot
 
 
 MAX_BODY = 2 * 1024 * 1024
@@ -26,10 +28,6 @@ def valid_sql(value):
         return False
 
 
-def unsigned(value):
-    return type(value) is int and 0 <= value < 2**63
-
-
 def valid_entry(entry, term):
     if not isinstance(entry, dict) or not unsigned(entry.get("term")):
         return False
@@ -37,10 +35,11 @@ def valid_entry(entry, term):
         return False
     if entry.keys() == {"term"}:
         return True
-    return (
-        entry.keys() == {"term", "request_id", "sql"}
-        and valid_request_id(entry["request_id"]) and valid_sql(entry["sql"])
+    required = {"term", "request_id", "sql"}
+    command = entry.keys() == required or (
+        entry.keys() == required | {"legacy"} and entry["legacy"] is True
     )
+    return command and valid_request_id(entry["request_id"]) and valid_sql(entry["sql"])
 
 
 def valid_raft_message(node, path, data):
@@ -56,6 +55,21 @@ def valid_raft_message(node, path, data):
             unsigned(data.get("last_index")) and unsigned(data.get("last_term"))
             and data["last_term"] <= term
         )
+    if path == "/raft/snapshot":
+        info, offset, raw = data.get("snapshot"), data.get("offset"), data.get("data")
+        if (
+            not valid_snapshot(info) or info["term"] > term or not unsigned(offset)
+            or not isinstance(raw, str) or len(raw) > 4 * ((SNAPSHOT_CHUNK + 2) // 3)
+        ):
+            return False
+        try:
+            chunk = base64.b64decode(raw, validate=True)
+        except ValueError:
+            return False
+        if not 0 < len(chunk) <= SNAPSHOT_CHUNK or offset + len(chunk) > info["size"]:
+            return False
+        data["data"] = chunk
+        return True
     if not all(unsigned(data.get(field)) for field in ("prev_index", "prev_term", "commit")):
         return False
     entries = data.get("entries")
@@ -77,11 +91,20 @@ class Handler(BaseHTTPRequestHandler):
     def do_GET(self):
         if self.path == "/status":
             self.send_json(200, self.server.node.status())
+        elif self.path == "/stats":
+            self.dispatch(lambda: (200, self.server.node.stats()))
         else:
             self.error_json(404, "unknown_route", "Unknown route")
 
     def do_POST(self):
-        if self.path not in ("/sql", "/raft/vote", "/raft/append"):
+        node = self.server.node
+        methods = {
+            "/raft/vote": node.request_vote,
+            "/raft/append": node.append_entries,
+            "/raft/snapshot": node.install_snapshot,
+        }
+        maintenance = {"/admin/snapshot", "/admin/compact", "/admin/verify"}
+        if self.path != "/sql" and self.path not in methods and self.path not in maintenance:
             self.error_json(404, "unknown_route", "Unknown route")
             return
         try:
@@ -94,18 +117,39 @@ class Handler(BaseHTTPRequestHandler):
         except (ValueError, RecursionError, OSError):
             self.error_json(400, "bad_request", "Expected a bounded JSON object")
             return
-        node = self.server.node
         if self.path == "/sql":
             request_id, sql = data.get("request_id"), data.get("sql")
             if not valid_request_id(request_id) or not valid_sql(sql):
                 self.error_json(400, "bad_request", "Expected a valid request_id and a SQL statement")
                 return
-            self.dispatch(node.propose, request_id, sql)
+            page = data.get("page")
+            if page is not None and (
+                not isinstance(page, dict) or not unsigned(page.get("offset"))
+                or not unsigned(page.get("size")) or not 1 <= page["size"] <= 10_000
+            ):
+                self.error_json(400, "bad_request", "Expected a valid result page")
+                return
+            self.dispatch(self.query, request_id, sql, page)
+        elif self.path in maintenance:
+            if data.get("cluster") != node.cluster:
+                self.error_json(400, "bad_request", "Invalid cluster identity")
+                return
+            self.dispatch(node.maintenance, self.path.rsplit("/", 1)[-1])
         elif valid_raft_message(node, self.path, data):
-            method = node.request_vote if self.path == "/raft/vote" else node.append_entries
-            self.dispatch(lambda: (200, method(data)))
+            self.dispatch(lambda: (200, methods[self.path](data)))
         else:
             self.error_json(400, "bad_request", "Invalid Raft RPC")
+
+    def query(self, request_id, sql, page):
+        status, result = self.server.node.propose(request_id, sql)
+        if page is not None and "rows" in result:
+            offset, size = page["offset"], page["size"]
+            rows = result["rows"]
+            end = offset + size
+            result = {
+                **result, "rows": rows[offset:end], "next_offset": end if end < len(rows) else None,
+            }
+        return status, result
 
     def dispatch(self, method, *args):
         try:
@@ -134,6 +178,8 @@ class Handler(BaseHTTPRequestHandler):
 
 
 class Server(ThreadingHTTPServer):
+    daemon_threads = False
+
     def __init__(self, address, node):
         self.node = node
         super().__init__(address, Handler)

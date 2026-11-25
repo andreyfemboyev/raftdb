@@ -15,8 +15,9 @@ class RaftTests(unittest.TestCase):
 
     def open_node(self):
         self.storage = Storage(self.directory)
-        self.addCleanup(self.storage.lock.close)
+        self.addCleanup(self.storage.close)
         self.node = Node("a", self.members, "raft-unit-test", self.storage)
+        self.addCleanup(self.node.db.store.close)
 
     def append(self, term, prev, prev_term, entries, commit):
         return self.node.append_entries({
@@ -52,7 +53,8 @@ class RaftTests(unittest.TestCase):
         self.append(1, 0, 0, [{"term": 1}], 1)
         ballot = {"source": "b", "term": 2, "last_term": 1, "last_index": 1}
         self.assertTrue(self.node.request_vote(ballot)["granted"])
-        self.storage.lock.close()
+        self.node.db.store.close()
+        self.storage.close()
         self.open_node()
         self.assertFalse(self.node.request_vote(ballot | {"source": "c"})["granted"])
         self.assertFalse(self.node.request_vote(

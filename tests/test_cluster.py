@@ -1,18 +1,59 @@
 from concurrent.futures import ThreadPoolExecutor
 import http.client
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+import io
 import json
 from pathlib import Path
 import socket
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import unittest
 
-from raftdb.raft import rpc
+from raftdb.client import Client
+from raftdb.raft import SNAPSHOT_CHUNK, rpc
+from raftdb.relational import Relational
+from raftdb.storage import Storage
 
 
 ROOT = Path(__file__).resolve().parents[1]
+
+
+class Relay(BaseHTTPRequestHandler):
+    def do_GET(self):
+        connection = http.client.HTTPConnection(*self.server.destination, timeout=0.5)
+        try:
+            connection.request("GET", self.path)
+            with connection.getresponse() as result:
+                self.reply(result.status, json.load(result))
+        except (OSError, http.client.HTTPException, ValueError):
+            self.reply(503, {})
+        finally:
+            connection.close()
+
+    def do_POST(self):
+        payload = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
+        if (payload.get("source"), self.server.member) in self.server.blocked:
+            self.reply(503, {})
+            return
+        try:
+            status, result = rpc(self.server.destination, self.path, payload, timeout=3)
+        except (OSError, http.client.HTTPException, ValueError):
+            status, result = 503, {}
+        self.reply(status, result)
+
+    def reply(self, status, result):
+        try:
+            self.send_response(status)
+            self.end_headers()
+            self.wfile.write(json.dumps(result).encode())
+        except (BrokenPipeError, ConnectionResetError):
+            pass
+
+    def log_message(self, *args):
+        pass
 
 
 class ClusterTests(unittest.TestCase):
@@ -23,6 +64,9 @@ class ClusterTests(unittest.TestCase):
         self.config = self.directory / "cluster.json"
         self.members = {}
         self.processes = {}
+        self.blocked = set()
+        self.relays = []
+        self.addCleanup(self.stop_relays)
         self.addCleanup(self.stop_all)
         sockets = []
         try:
@@ -36,8 +80,14 @@ class ClusterTests(unittest.TestCase):
                 reservation.close()
         self.config.write_text(json.dumps({
             "cluster": "integration",
-            "nodes": {node: f"{host}:{port}" for node, (host, port) in self.members.items()},
+            "nodes": {node: f"127.0.0.2:{port}" for node, (_, port) in self.members.items()},
         }))
+        for member, destination in self.members.items():
+            relay = ThreadingHTTPServer(("127.0.0.2", destination[1]), Relay)
+            relay.member, relay.destination, relay.blocked = member, destination, self.blocked
+            thread = threading.Thread(target=relay.serve_forever, kwargs={"poll_interval": 0.05}, daemon=True)
+            self.relays.append((relay, thread))
+            thread.start()
         for node in self.members:
             self.start(node)
 
@@ -45,7 +95,8 @@ class ClusterTests(unittest.TestCase):
         with (self.directory / f"{node}.log").open("ab") as log:
             self.processes[node] = subprocess.Popen(
                 [sys.executable, "-m", "raftdb", "serve", "--node", node,
-                 "--data", str(self.directory / node), "--config", str(self.config)],
+                 "--data", str(self.directory / node), "--config", str(self.config),
+                 "--bind", "127.0.0.1", "--snapshot-interval", "12", "--segment-size", "65536"],
                 cwd=ROOT, stdout=log, stderr=subprocess.STDOUT,
             )
 
@@ -58,6 +109,16 @@ class ClusterTests(unittest.TestCase):
     def stop_all(self):
         for node in list(self.processes):
             self.stop(node)
+
+    def stop_relays(self):
+        for relay, thread in self.relays:
+            relay.shutdown()
+            thread.join()
+            relay.server_close()
+
+    def client(self):
+        configured = Client.from_config(self.config)
+        return Client(self.members, cluster=configured.cluster)
 
     def get_status(self, node):
         connection = http.client.HTTPConnection(*self.members[node], timeout=0.25)
@@ -165,9 +226,107 @@ class ClusterTests(unittest.TestCase):
 
         self.start(leader)
         self.caught_up(list(self.members), read["index"])
-        log = json.loads((self.directory / leader / "raft.json").read_text())["log"]
-        self.assertNotIn("lost-write", [entry.get("request_id") for entry in log])
-        self.assertNotIn("lost-read", [entry.get("request_id") for entry in log])
+        self.stop(leader)
+        storage = Storage(self.directory / leader)
+        self.addCleanup(storage.close)
+        log = storage.log.batch(storage.log.base + 1, storage.log.last_index - storage.log.base)
+        requests = [entry.get("request_id") for entry in log]
+        self.assertNotIn("lost-write", requests)
+        self.assertNotIn("lost-read", requests)
+
+
+    def test_live_minority_partition_rejects_fresh_reads_and_writes(self):
+        leader = self.leader()
+        created = self.submit(leader, "create", "CREATE TABLE test (id INTEGER PRIMARY KEY)")
+        self.caught_up(list(self.members), created["index"])
+        followers = [node for node in self.members if node != leader]
+        self.blocked.update(
+            edge
+            for follower in followers
+            for edge in ((leader, follower), (follower, leader))
+        )
+        successor = self.leader(among=followers)
+        self.assertEqual(self.get_status(leader)["role"], "leader")
+        confirmed = self.submit(successor, "majority", "INSERT INTO test VALUES (42)")
+        with ThreadPoolExecutor(max_workers=2) as workers:
+            futures = [
+                workers.submit(self.submit, leader, "minority-read", "SELECT * FROM test", 503),
+                workers.submit(self.submit, leader, "minority-write", "INSERT INTO test VALUES (41)", 503),
+            ]
+            self.assertTrue(all(future.result()["code"] == "commit_timeout" for future in futures))
+        self.assertEqual(self.get_status(leader)["commit_index"], created["index"])
+        self.blocked.clear()
+        self.caught_up(list(self.members), confirmed["index"])
+        read = self.submit(successor, "after-heal", "SELECT id FROM test ORDER BY id")
+        self.assertEqual(read["rows"], [[42]])
+
+    def test_multichunk_snapshot_repairs_lagging_replica_and_survives_restart(self):
+        leader = self.leader()
+        lagging = next(node for node in self.members if node != leader)
+        self.stop(lagging)
+        created = self.submit(leader, "create-big", "CREATE TABLE big (id INTEGER PRIMARY KEY, data TEXT)")
+        self.assertGreater(created["index"], 0)
+        values = [[number, str(number % 10) * 10_000] for number in range(20)]
+        client = self.client()
+        for number, payload in values:
+            client.execute("INSERT INTO big VALUES (?, ?)", (number, payload), request_id=f"load-{number}")
+        snapshot = self.cli("snapshot", "--node", leader)[leader]["snapshot"]
+        self.assertGreater(snapshot["size"], SNAPSHOT_CHUNK)
+        self.assertGreater(snapshot["index"], created["index"])
+        inserted = self.submit(leader, "after-snapshot", "INSERT INTO big VALUES (20, 'suffix')")
+        self.start(lagging)
+        self.caught_up(list(self.members), inserted["index"])
+        self.assertGreaterEqual(self.get_status(lagging)["snapshot_index"], snapshot["index"])
+        self.assertEqual(self.cli("compact", "--node", lagging)[lagging]["ok"], True)
+        for state in self.cli("verify").values():
+            self.assertTrue(state["ok"])
+
+        self.stop_all()
+        for member in self.members:
+            verified = self.cli("verify", "--data", str(self.directory / member))
+            self.assertEqual(verified["replay_pending"], 0)
+            db = Relational(self.directory / member / "relational", 65536, repair=False)
+            try:
+                rows = db.tables["big"].rows
+                self.assertEqual([[key, rows[key]["data"]] for key in sorted(rows)], values + [[20, "suffix"]])
+                self.assertEqual(db.result("after-snapshot")[1], inserted["index"])
+            finally:
+                db.store.close()
+
+        for member in self.members:
+            self.start(member)
+        self.assertEqual(self.cli("sql", "SELECT COUNT(*) FROM big")["rows"], [[21]])
+
+    def test_parameter_binding_csv_exports_and_batches_across_failover(self):
+        client = self.client()
+        leader = self.leader()
+        client.execute("CREATE TABLE items (id INTEGER PRIMARY KEY, note TEXT, active BOOLEAN)")
+        hostile = "'); DROP TABLE items; SELECT '?\n"
+        client.execute("INSERT INTO items VALUES (?, ?, ?)", [1, hostile, True])
+        client.execute("INSERT INTO items VALUES (?, ?, ?)", [2, r"\N", None])
+        client.execute("INSERT INTO items VALUES (?, ?, ?)", [3, None, False])
+        pages = client.query_batches("SELECT * FROM items ORDER BY id", batch_size=1)
+        first = next(pages)
+        self.assertEqual(first["rows"], [[1, hostile, True]])
+        self.stop(leader)
+        self.leader()
+        client.execute("UPDATE items SET note = 'changed' WHERE id = 2")
+        second, third = list(pages)
+        self.assertEqual(second["rows"], [[2, r"\N", None]])
+        self.assertEqual(third["rows"], [[3, None, False]])
+        self.assertEqual({first["index"], second["index"], third["index"]}, {first["index"]})
+
+        client.execute("CREATE TABLE copy (id INTEGER PRIMARY KEY, note TEXT, active BOOLEAN)")
+        data = io.StringIO()
+        client.export_csv(data, "SELECT * FROM items ORDER BY id", batch_size=2)
+        data.seek(0)
+        types = {"id": "INTEGER", "note": "TEXT", "active": "BOOLEAN"}
+        self.assertEqual(client.import_csv("copy", data, types, batch_size=2, request_id="import"), 3)
+        data.seek(0)
+        self.assertEqual(client.import_csv("copy", data, types, batch_size=2, request_id="import"), 3)
+        result = io.StringIO()
+        client.export_json(result, "SELECT * FROM copy ORDER BY id", batch_size=1)
+        self.assertEqual(json.loads(result.getvalue())["rows"], [[1, hostile, True], [2, "changed", None], [3, None, False]])
 
 
 if __name__ == "__main__":

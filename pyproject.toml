@@ -1,0 +1,29 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "raftdb"
+version = "0.2.0"
+description = "A fixed-membership Raft database with native segmented relational storage"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = []
+classifiers = [
+    "Operating System :: POSIX :: Linux",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3 :: Only",
+    "Topic :: Database :: Database Engines/Servers",
+]
+
+[project.optional-dependencies]
+data-science = ["numpy", "pandas"]
+
+[project.scripts]
+raftdb = "raftdb.__main__:main"
+
+[project.urls]
+Repository = "https://github.com/andreyfemboyev/raftdb"
+
+[tool.setuptools.packages.find]
+include = ["raftdb*"]

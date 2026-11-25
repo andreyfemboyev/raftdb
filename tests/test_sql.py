@@ -44,5 +44,22 @@ class SQLTests(unittest.TestCase):
         )
 
 
+    def test_aggregates_offset_drop_and_contextual_identifiers(self):
+        self.db.execute("CREATE TABLE sums (id INTEGER PRIMARY KEY, sum INTEGER)")
+        self.db.execute("INSERT INTO sums VALUES (1, 4), (2, NULL), (3, 8), (4, -3)")
+        for query, expected in (
+            ("COUNT(*)", 4), ("COUNT(sum)", 3), ("SUM(sum)", 9),
+            ("AVG(sum)", 3.0), ("MIN(sum)", -3), ("MAX(sum)", 8),
+        ):
+            self.assertEqual(self.db.execute(f"SELECT {query} FROM sums")["rows"], [[expected]])
+        self.assertEqual(self.db.execute("SELECT SUM(sum) FROM sums WHERE id = 2")["rows"], [[None]])
+        self.assertEqual(self.db.execute("SELECT SUM(sum) FROM sums OFFSET 1")["rows"], [])
+        self.assertEqual(self.db.execute("SELECT sum FROM sums ORDER BY id LIMIT 2 OFFSET 1")["rows"], [[None], [8]])
+        self.assertEqual(self.db.execute("SELECT id FROM sums ORDER BY id OFFSET 3")["rows"], [[4]])
+        self.assertEqual(self.db.execute("DROP TABLE sums"), {"affected": 0})
+        with self.assertRaises(SQLError):
+            self.db.execute("SELECT * FROM sums")
+
+
 if __name__ == "__main__":
     unittest.main()
